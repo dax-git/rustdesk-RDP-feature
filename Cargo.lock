@@ -10689,6 +10689,7 @@ dependencies = [
 name = "x11_privacy"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "log",
  "x11rb 0.12.0",
 ]

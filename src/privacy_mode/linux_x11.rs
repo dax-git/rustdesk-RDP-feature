@@ -2,17 +2,24 @@
 //!
 //! Like the macOS implementation: the physical monitors are blacked out through the CRTC gamma
 //! ramp (the framebuffer, and so the capture, is unaffected) and physical keyboards/mice are
-//! disabled through XInput, while remote input (XTEST) keeps working. See `libs/x11_privacy`.
+//! grabbed away from the desktop, while remote input (XTEST) keeps working.
+//!
+//! Like logging on at the console of a Windows machine used over RDP, a key press at the
+//! console shows the lock screen there; unlocking it ends the remote session.
+//! See `libs/x11_privacy`.
 
-use super::{PrivacyMode, PrivacyModeState};
-use hbb_common::{anyhow::anyhow, config::Config, log, ResultType};
+use super::{PrivacyMode, PrivacyModeState, INVALID_PRIVACY_MODE_CONN_ID};
+use hbb_common::{anyhow::anyhow, config::Config, log, tokio, ResultType};
 use std::{
-    process::Command,
-    time::{Duration, Instant},
+    sync::atomic::{AtomicI32, Ordering},
+    time::Duration,
 };
 use x11_privacy::{Options, PrivacyGuard};
 
 pub const PRIVACY_MODE_IMPL: &str = "privacy_mode_impl_x11";
+
+/// The connection whose session was taken over at the console, if any.
+static TAKEN_OVER_CONN_ID: AtomicI32 = AtomicI32::new(INVALID_PRIVACY_MODE_CONN_ID);
 
 fn state_file() -> std::path::PathBuf {
     Config::path("privacy_mode_x11.state")
@@ -31,61 +38,46 @@ pub fn recover() {
     }
 }
 
-/// Asks the screen locker over the session bus whether it is showing.
-/// `None` if no known locker answered.
-fn is_screen_locker_active() -> Option<bool> {
-    const LOCKERS: &[(&str, &str)] = &[
-        ("org.cinnamon.ScreenSaver", "/org/cinnamon/ScreenSaver"),
-        ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver"),
-        ("org.mate.ScreenSaver", "/org/mate/ScreenSaver"),
-        ("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver"),
-    ];
-    let bus = std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_else(|_| {
-        format!("unix:path=/run/user/{}/bus", unsafe { hbb_common::libc::getuid() })
-    });
-    for (dest, path) in LOCKERS {
-        let out = Command::new("dbus-send")
-            .env("DBUS_SESSION_BUS_ADDRESS", &bus)
-            .args([
-                "--session",
-                "--print-reply=literal",
-                "--reply-timeout=500",
-                &format!("--dest={dest}"),
-                path,
-                &format!("{dest}.GetActive"),
-            ])
-            .output();
-        if let Ok(out) = out {
-            if out.status.success() {
-                return Some(String::from_utf8_lossy(&out.stdout).contains("true"));
-            }
-        }
-    }
-    None
+/// True if the person at the console unlocked the session of `conn_id`. The session must then
+/// not be locked again when that connection closes.
+pub fn is_taken_over(conn_id: i32) -> bool {
+    conn_id != INVALID_PRIVACY_MODE_CONN_ID && TAKEN_OVER_CONN_ID.load(Ordering::SeqCst) == conn_id
 }
 
-/// Used when the session ends with "lock after session end": waits (up to `timeout`) until the
-/// lock screen is up, so that switching the monitors back on never shows the unlocked desktop.
-pub fn wait_for_screen_locked(timeout: Duration) {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        match is_screen_locker_active() {
-            Some(true) => {
-                // Give the locker a moment to finish painting / fading in.
-                std::thread::sleep(Duration::from_millis(500));
-                log::info!("Screen locked after {:?}", start.elapsed());
-                return;
-            }
-            Some(false) => std::thread::sleep(Duration::from_millis(100)),
-            None => {
-                // Unknown locker: we cannot tell, just give it a fixed time.
-                log::warn!("No screen locker answered on D-Bus, waiting a fixed time");
-                std::thread::sleep(timeout.min(Duration::from_secs(2)));
-                return;
+/// Called when the connection that owns privacy mode closes, before privacy mode is turned off.
+/// With "lock after session end", waits until the lock screen is up, so that switching the
+/// monitors back on never shows the unlocked desktop.
+pub async fn before_turn_off_on_close(conn_id: i32, lock_requested: bool) {
+    if !lock_requested
+        || is_taken_over(conn_id)
+        || !super::is_current_privacy_mode_impl(PRIVACY_MODE_IMPL)
+    {
+        return;
+    }
+    let locked = tokio::task::spawn_blocking(|| {
+        x11_privacy::wait_for_screen_locked(Duration::from_secs(5))
+    })
+    .await
+    .unwrap_or(false);
+    if !locked {
+        log::warn!("The screen did not report locked before leaving privacy mode");
+    }
+}
+
+fn on_takeover(conn_id: i32) {
+    log::info!(
+        "Session unlocked at the console, closing remote connection {}",
+        conn_id
+    );
+    TAKEN_OVER_CONN_ID.store(conn_id, Ordering::SeqCst);
+    // Must not take the privacy mode lock: its holder may be joining the thread we run on.
+    for conn in crate::server::AUTHED_CONNS.lock().unwrap().iter() {
+        if conn.conn_id == conn_id {
+            if let Err(e) = conn.sender.send(crate::ipc::Data::Close) {
+                log::error!("Failed to close connection {}: {}", conn_id, e);
             }
         }
     }
-    log::warn!("Screen was not locked within {:?}", timeout);
 }
 
 pub struct PrivacyModeImpl {
@@ -98,7 +90,7 @@ impl PrivacyModeImpl {
     pub fn new(impl_key: &str) -> Self {
         Self {
             impl_key: impl_key.to_owned(),
-            conn_id: 0,
+            conn_id: INVALID_PRIVACY_MODE_CONN_ID,
             guard: None,
         }
     }
@@ -108,7 +100,7 @@ impl PrivacyModeImpl {
             Some(guard) => guard.turn_off().map_err(|e| anyhow!(e.to_string())),
             None => Ok(()),
         };
-        self.conn_id = 0;
+        self.conn_id = INVALID_PRIVACY_MODE_CONN_ID;
         res
     }
 }
@@ -132,7 +124,12 @@ impl PrivacyMode for PrivacyModeImpl {
         if self.check_on_conn_id(conn_id)? {
             return Ok(true);
         }
-        let guard = PrivacyGuard::turn_on(Options::default(), state_file())
+        TAKEN_OVER_CONN_ID.store(INVALID_PRIVACY_MODE_CONN_ID, Ordering::SeqCst);
+        let opts = Options {
+            on_takeover: Some(Box::new(move || on_takeover(conn_id))),
+            ..Default::default()
+        };
+        let guard = PrivacyGuard::turn_on(opts, state_file())
             .map_err(|e| anyhow!("Failed to turn on privacy mode: {}", e))?;
         self.guard = Some(guard);
         self.conn_id = conn_id;
