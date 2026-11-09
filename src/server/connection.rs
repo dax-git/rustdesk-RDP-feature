@@ -1228,6 +1228,19 @@ impl Connection {
 
         if let Some(video_privacy_conn_id) = privacy_mode::get_privacy_mode_conn_id() {
             if video_privacy_conn_id == id {
+                // Like Windows RDP: the console must come back locked, never showing the desktop.
+                #[cfg(target_os = "linux")]
+                if conn.lock_after_session_end
+                    && conn.keyboard
+                    && privacy_mode::is_current_privacy_mode_impl(
+                        privacy_mode::linux_x11::PRIVACY_MODE_IMPL,
+                    )
+                {
+                    let _ = tokio::task::spawn_blocking(|| {
+                        privacy_mode::linux_x11::wait_for_screen_locked(Duration::from_secs(5))
+                    })
+                    .await;
+                }
                 let _ = Self::turn_off_privacy_to_msg(id, String::new());
             }
         }
@@ -1993,7 +2006,7 @@ impl Connection {
                 json!(privacy_mode::get_supported_privacy_mode_impl()),
             );
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             platform_additions.insert(
                 "supported_privacy_mode_impl".into(),

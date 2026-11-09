@@ -1,0 +1,16 @@
+[package]
+name = "x11_privacy"
+version = "0.1.0"
+edition = "2021"
+description = "X11 privacy mode: black out physical monitors via RandR gamma and disable physical input devices, while screen capture and XTEST input keep working."
+
+[dependencies]
+x11rb = { version = "0.12", features = ["randr", "xinput"] }
+log = "0.4"
+
+[dev-dependencies]
+x11rb = { version = "0.12", features = ["randr", "xinput", "xtest"] }
+
+[[bin]]
+name = "x11-privacy"
+path = "src/main.rs"
