@@ -685,6 +685,7 @@ impl Worker {
 
     fn block_inputs(&mut self) -> Result<bool> {
         let mut changed = false;
+        let mut locked = None;
         for info in self.refresh_devices()? {
             if !is_physical(&info) || !info.enabled || self.grabbed.contains(&info.deviceid) {
                 continue;
@@ -699,6 +700,11 @@ impl Worker {
                 }
                 Ok(false) => log::warn!("x11 privacy: {} is grabbed by someone else", name),
                 Err(e) => log::warn!("x11 privacy: failed to grab {}: {}", name, e),
+            }
+            // While the lock screen is up, local input cannot reach the desktop, so keep the
+            // device usable for a console logon and try grabbing it again on the next round.
+            if *locked.get_or_insert_with(is_screen_locked) == Some(true) {
+                continue;
             }
             // Could not grab it: disable it instead (no takeover from this device then).
             match set_device_enabled(&self.conn, &self.atoms, info.deviceid, false) {

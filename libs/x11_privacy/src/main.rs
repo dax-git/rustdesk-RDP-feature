@@ -21,6 +21,21 @@ use x11_privacy::{recover, status, Options, Phase, PrivacyGuard};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
+/// Prints the library's log to stderr with a timestamp, so test runs show what it decided.
+struct StderrLogger(Instant);
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Info
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            eprintln!("[{:7.2}s {}] {}", self.0.elapsed().as_secs_f32(), r.level(), r.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
 extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
 }
@@ -48,6 +63,8 @@ fn main() {
         Some("status") => status().map(|s| print!("{s}")),
         Some("recover") => recover(&state_file()).map(|r| println!("recovered: {r}")),
         Some("on") => {
+            let logger: &'static StderrLogger = Box::leak(Box::new(StderrLogger(Instant::now())));
+            let _ = log::set_logger(logger).map(|()| log::set_max_level(log::LevelFilter::Info));
             install_signal_handlers();
             let secs = args.iter().skip(1).find_map(|a| a.parse::<u64>().ok()).unwrap_or(15);
             let taken_over = Arc::new(AtomicBool::new(false));
@@ -79,6 +96,9 @@ fn main() {
                         let p = guard.phase();
                         if p != phase {
                             println!("phase: {p:?}");
+                            if let Ok(s) = status() {
+                                print!("{s}");
+                            }
                             phase = p;
                         }
                     }
