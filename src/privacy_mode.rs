@@ -404,7 +404,7 @@ pub fn get_supported_privacy_mode_impl() -> Vec<(&'static str, &'static str)> {
     }
     #[cfg(target_os = "linux")]
     {
-        if linux_x11::is_supported() {
+        if DEFAULT_PRIVACY_MODE_IMPL.as_str() == linux_x11::PRIVACY_MODE_IMPL {
             vec![(linux_x11::PRIVACY_MODE_IMPL, "privacy_mode_impl_x11_tip")]
         } else {
             Vec::new()
