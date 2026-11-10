@@ -54,6 +54,8 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(4);
 /// Minimum time between two takeover attempts that failed to lock the screen.
 const TAKEOVER_RETRY: Duration = Duration::from_secs(5);
+/// A warning that can repeat every enforcement round is logged at most once per this interval.
+const WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Device names containing one of these are never blocked: they carry remote input.
 const KEEP_DEVICE_PATTERNS: &[&str] = &["XTEST", "RustDesk"];
@@ -414,19 +416,22 @@ fn deserialize(text: &str) -> SavedState {
     state
 }
 
-fn write_state(path: &Path, state: &SavedState) {
-    let res = (|| -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
+fn write_state(path: &Path, state: &SavedState) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let mut f = fs::File::create(&tmp)?;
+    f.write_all(serialize(state).as_bytes())?;
+    f.sync_all()?;
+    fs::rename(tmp, path)
+}
+
+fn remove_state(path: &Path) {
+    if let Err(e) = fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::error!("x11 privacy: failed to remove state file {:?}: {}", path, e);
         }
-        let tmp = path.with_extension("tmp");
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(serialize(state).as_bytes())?;
-        f.sync_all()?;
-        fs::rename(tmp, path)
-    })();
-    if let Err(e) = res {
-        log::error!("x11 privacy: failed to write state file {:?}: {}", path, e);
     }
 }
 
@@ -444,7 +449,7 @@ pub fn recover(state_file: &Path) -> Result<bool> {
     conn.flush()?;
     r1?;
     r2?;
-    let _ = fs::remove_file(state_file);
+    remove_state(state_file);
     log::info!("x11 privacy: recovered console from {:?}", state_file);
     Ok(true)
 }
@@ -464,20 +469,22 @@ enum SuspendedVerdict {
 }
 
 /// Decides what to do while the console shows the lock screen after a local key press.
+/// `last_input_local` says whether the most recent key press or click, in event order, came from
+/// the console (`Some(true)`) or from the remote side (`Some(false)`).
 fn suspended_verdict(
     locked: Option<bool>,
     now: Instant,
     suspended_at: Instant,
     last_local: Option<Instant>,
-    last_remote: Option<Instant>,
+    last_input_local: Option<bool>,
     idle: Duration,
 ) -> SuspendedVerdict {
     if locked == Some(false) {
         // Unlocked: whoever typed last did it.
-        return match (last_local, last_remote) {
-            (Some(l), Some(r)) if l > r => SuspendedVerdict::Takeover,
-            (Some(_), None) => SuspendedVerdict::Takeover,
-            _ => SuspendedVerdict::Reactivate,
+        return if last_input_local == Some(true) {
+            SuspendedVerdict::Takeover
+        } else {
+            SuspendedVerdict::Reactivate
         };
     }
     // Still locked (or the locker did not answer this time).
@@ -557,27 +564,40 @@ struct Shared {
 impl PrivacyGuard {
     pub fn turn_on(opts: Options, state_file: PathBuf) -> Result<Self> {
         // Leftovers from a crash would otherwise be saved as "original" (black) values.
-        let _ = recover(&state_file);
+        recover(&state_file)?;
 
         let mut worker = Worker::new(opts, state_file.clone())?;
         // Write the (empty) state first, so a crash in the middle is still recoverable.
-        write_state(&state_file, &worker.saved);
+        write_state(&state_file, &worker.saved)?;
         if let Err(e) = worker.activate() {
             worker.restore_all();
-            let _ = fs::remove_file(&state_file);
+            remove_state(&state_file);
             return Err(e);
         }
+        let saved = worker.saved.clone();
 
         let shared = Arc::new(Mutex::new(Shared {
             saved: worker.saved.clone(),
             phase: Phase::Active,
         }));
         let stop = Arc::new(AtomicBool::new(false));
-        let thread = {
+        let spawned = {
             let (shared, stop) = (shared.clone(), stop.clone());
             std::thread::Builder::new()
                 .name("x11-privacy".into())
-                .spawn(move || worker.run(shared, stop))?
+                .spawn(move || worker.run(shared, stop))
+        };
+        let thread = match spawned {
+            Ok(thread) => thread,
+            Err(e) => {
+                // The worker (and its grabs) went away with the closure; undo the rest.
+                if let Err(e) = restore_saved(&saved) {
+                    log::error!("x11 privacy: failed to roll back: {}", e);
+                } else {
+                    remove_state(&state_file);
+                }
+                return Err(e.into());
+            }
         };
         Ok(Self {
             shared,
@@ -601,18 +621,54 @@ impl PrivacyGuard {
         };
         self.stop.store(true, Ordering::SeqCst);
         // The worker restores everything itself before it exits.
-        let _ = thread.join();
+        if thread.join().is_err() {
+            log::error!("x11 privacy: the worker thread panicked");
+        }
         // Belt and braces, in case the worker could not: restore from the saved state.
         let saved = self.shared.lock().unwrap().saved.clone();
-        let (conn, root) = connect()?;
-        let atoms = input_atoms(&conn)?;
-        let r1 = enable_inputs(&conn, &atoms, &saved.devices);
-        let r2 = restore_gamma(&conn, root, &saved);
-        conn.flush()?;
-        r1?;
-        r2?;
-        let _ = fs::remove_file(&self.state_file);
+        restore_saved(&saved)?;
+        remove_state(&self.state_file);
         Ok(())
+    }
+}
+
+/// Restores gamma and re-enables disabled devices from `saved`, on a connection of its own.
+fn restore_saved(saved: &SavedState) -> Result<()> {
+    let (conn, root) = connect()?;
+    let atoms = input_atoms(&conn)?;
+    let r1 = enable_inputs(&conn, &atoms, &saved.devices);
+    let r2 = restore_gamma(&conn, root, saved);
+    conn.flush()?;
+    r1?;
+    r2
+}
+
+/// Logs a warning that can repeat every round at most once per [`WARN_INTERVAL`] per call site,
+/// with the number of repeats it held back.
+#[derive(Default)]
+struct WarnThrottle(HashMap<&'static str, (Instant, u32)>);
+
+impl WarnThrottle {
+    fn warn(&mut self, site: &'static str, msg: std::fmt::Arguments) {
+        let now = Instant::now();
+        if let Some((last, held_back)) = self.0.get_mut(site) {
+            if now.duration_since(*last) < WARN_INTERVAL {
+                *held_back += 1;
+                return;
+            }
+            if *held_back > 0 {
+                log::warn!(
+                    "x11 privacy: {} ({} more since last report)",
+                    msg,
+                    held_back
+                );
+                *last = now;
+                *held_back = 0;
+                return;
+            }
+        }
+        log::warn!("x11 privacy: {}", msg);
+        self.0.insert(site, (now, 0));
     }
 }
 
@@ -638,8 +694,10 @@ struct Worker {
     devices: HashMap<xinput::DeviceId, (String, bool)>,
     suspended_at: Instant,
     last_local: Option<Instant>,
-    last_remote: Option<Instant>,
+    /// Whether the latest key press or click, in event order, came from the console.
+    last_input_local: Option<bool>,
     last_failed_takeover: Option<Instant>,
+    warnings: WarnThrottle,
 }
 
 impl Worker {
@@ -668,8 +726,9 @@ impl Worker {
             devices: HashMap::new(),
             suspended_at: Instant::now(),
             last_local: None,
-            last_remote: None,
+            last_input_local: None,
             last_failed_takeover: None,
+            warnings: WarnThrottle::default(),
         })
     }
 
@@ -685,7 +744,7 @@ impl Worker {
         }
         self.conn.flush()?;
         if changed {
-            write_state(&self.state_file, &self.saved);
+            write_state(&self.state_file, &self.saved)?;
         }
         Ok(changed)
     }
@@ -725,8 +784,12 @@ impl Worker {
                     changed = true;
                     continue;
                 }
-                Ok(false) => log::warn!("x11 privacy: {} is grabbed by someone else", name),
-                Err(e) => log::warn!("x11 privacy: failed to grab {}: {}", name, e),
+                Ok(false) => self
+                    .warnings
+                    .warn("grab", format_args!("{} is grabbed by someone else", name)),
+                Err(e) => self
+                    .warnings
+                    .warn("grab", format_args!("failed to grab {}: {}", name, e)),
             }
             // While the lock screen is up, local input cannot reach the desktop, so keep the
             // device usable for a console logon and try grabbing it again on the next round.
@@ -734,6 +797,16 @@ impl Worker {
                 continue;
             }
             // Could not grab it: disable it instead (no takeover from this device then).
+            // Record it first, so that a crash right after cannot leave it disabled for good.
+            self.saved.devices.insert(name.clone());
+            if let Err(e) = write_state(&self.state_file, &self.saved) {
+                self.saved.devices.remove(&name);
+                self.warnings.warn(
+                    "disable",
+                    format_args!("not disabling {}, the state file failed: {}", name, e),
+                );
+                continue;
+            }
             match set_device_enabled(&self.conn, &self.atoms, info.deviceid, false) {
                 Ok(()) => {
                     log::info!(
@@ -741,11 +814,14 @@ impl Worker {
                         info.deviceid,
                         name
                     );
-                    self.saved.devices.insert(name);
                     changed = true;
                 }
                 // A device may vanish between query and change; keep going with the others.
-                Err(e) => log::warn!("x11 privacy: failed to disable {}: {}", name, e),
+                Err(e) => {
+                    self.saved.devices.remove(&name);
+                    self.warnings
+                        .warn("disable", format_args!("failed to disable {}: {}", name, e));
+                }
             }
         }
         Ok(changed)
@@ -753,14 +829,21 @@ impl Worker {
 
     fn unblock_inputs(&mut self) {
         for id in std::mem::take(&mut self.grabbed) {
-            if let Ok(c) = self.conn.xinput_xi_ungrab_device(x11rb::CURRENT_TIME, id) {
-                let _ = c.check();
+            let res = self
+                .conn
+                .xinput_xi_ungrab_device(x11rb::CURRENT_TIME, id)
+                .map_err(|e| e.to_string())
+                .and_then(|c| c.check().map_err(|e| e.to_string()));
+            if let Err(e) = res {
+                // The grab dies with our connection at the latest.
+                log::warn!("x11 privacy: failed to ungrab device {}: {}", id, e);
             }
         }
-        if let Err(e) = enable_inputs(&self.conn, &self.atoms, &self.saved.devices) {
-            log::warn!("x11 privacy: failed to re-enable inputs: {}", e);
+        match enable_inputs(&self.conn, &self.atoms, &self.saved.devices) {
+            Ok(()) => self.saved.devices.clear(),
+            // Keep the names, so turn-off and crash recovery try again.
+            Err(e) => log::warn!("x11 privacy: failed to re-enable inputs: {}", e),
         }
-        self.saved.devices.clear();
     }
 
     /// Brings the console back (gamma and input). `saved` is kept for a later re-activation.
@@ -769,8 +852,12 @@ impl Worker {
         if let Err(e) = restore_gamma(&self.conn, self.root, &self.saved) {
             log::error!("x11 privacy: failed to restore gamma: {}", e);
         }
-        let _ = self.conn.flush();
-        write_state(&self.state_file, &self.saved);
+        if let Err(e) = self.conn.flush() {
+            log::error!("x11 privacy: failed to flush the X connection: {}", e);
+        }
+        if let Err(e) = write_state(&self.state_file, &self.saved) {
+            log::error!("x11 privacy: failed to write the state file: {}", e);
+        }
     }
 
     /// Reads pending X events. Returns true if a person touched a physical device.
@@ -782,7 +869,8 @@ impl Worker {
                 Ok(Some(e)) => e,
                 Ok(None) => break,
                 Err(e) => {
-                    log::warn!("x11 privacy: X connection error: {}", e);
+                    self.warnings
+                        .warn("x11", format_args!("X connection error: {}", e));
                     break;
                 }
             };
@@ -796,9 +884,10 @@ impl Worker {
             match self.devices.get(&source) {
                 Some((name, true)) if is_person(name) => {
                     self.last_local = Some(now);
+                    self.last_input_local = Some(true);
                     local = true;
                 }
-                Some((_, false)) => self.last_remote = Some(now),
+                Some((_, false)) => self.last_input_local = Some(false),
                 _ => {}
             }
         }
@@ -826,7 +915,7 @@ impl Worker {
         self.phase = Phase::Suspended;
         self.suspended_at = Instant::now();
         self.last_local = None;
-        self.last_remote = None;
+        self.last_input_local = None;
     }
 
     fn step_suspended(&mut self) {
@@ -835,7 +924,7 @@ impl Worker {
             Instant::now(),
             self.suspended_at,
             self.last_local,
-            self.last_remote,
+            self.last_input_local,
             self.opts.suspend_idle,
         );
         match verdict {
@@ -844,13 +933,14 @@ impl Worker {
                 log::info!("x11 privacy: nobody logged on at the console, blacking out again");
                 self.phase = Phase::Active;
                 if let Err(e) = self.activate() {
-                    log::warn!("x11 privacy: failed to re-activate: {}", e);
+                    self.warnings
+                        .warn("activate", format_args!("failed to re-activate: {}", e));
                 }
             }
             SuspendedVerdict::Takeover => {
                 log::info!("x11 privacy: unlocked at the console, ending privacy mode");
                 self.phase = Phase::TakenOver;
-                let _ = fs::remove_file(&self.state_file);
+                remove_state(&self.state_file);
                 if let Some(cb) = &self.opts.on_takeover {
                     cb();
                 }
@@ -868,13 +958,17 @@ impl Worker {
                 Phase::Active if last_enforce.elapsed() >= ENFORCE_INTERVAL => {
                     last_enforce = Instant::now();
                     if let Err(e) = self.activate() {
-                        log::warn!("x11 privacy: enforce failed: {}", e);
+                        self.warnings
+                            .warn("activate", format_args!("enforce failed: {}", e));
                     }
                 }
                 Phase::Suspended if last_enforce.elapsed() >= ENFORCE_INTERVAL => {
                     last_enforce = Instant::now();
                     // Keep the device map fresh for classifying events.
-                    let _ = self.refresh_devices();
+                    if let Err(e) = self.refresh_devices() {
+                        self.warnings
+                            .warn("devices", format_args!("failed to list devices: {}", e));
+                    }
                     self.step_suspended();
                 }
                 _ => {}
@@ -976,18 +1070,15 @@ mod tests {
         );
         // Locker did not answer: same as locked.
         assert_eq!(suspended_verdict(None, s(10), t0, None, None, idle), Stay);
-        // Unlocked after local typing: takeover.
+        // Unlocked, and the last key press came from the console: takeover. This holds even when
+        // a remote press came in the same batch just before it (same timestamp).
         assert_eq!(
-            suspended_verdict(Some(false), s(5), t0, Some(s(4)), None, idle),
-            Takeover
-        );
-        assert_eq!(
-            suspended_verdict(Some(false), s(5), t0, Some(s(4)), Some(s(2)), idle),
+            suspended_verdict(Some(false), s(5), t0, Some(s(4)), Some(true), idle),
             Takeover
         );
         // Unlocked by the remote side: black out again.
         assert_eq!(
-            suspended_verdict(Some(false), s(5), t0, Some(s(2)), Some(s(4)), idle),
+            suspended_verdict(Some(false), s(5), t0, Some(s(2)), Some(false), idle),
             Reactivate
         );
         assert_eq!(
