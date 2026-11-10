@@ -44,27 +44,25 @@ pub fn is_taken_over(conn_id: i32) -> bool {
     conn_id != INVALID_PRIVACY_MODE_CONN_ID && TAKEN_OVER_CONN_ID.load(Ordering::SeqCst) == conn_id
 }
 
+/// Locks the screen, if it is not locked yet, and waits until the lock screen is up.
+/// Returns false if it did not lock.
+fn lock_and_wait() -> bool {
+    (x11_privacy::is_screen_locked() == Some(true) || x11_privacy::lock_screen())
+        && x11_privacy::wait_for_screen_locked(Duration::from_secs(5))
+}
+
 /// Called when the connection that owns privacy mode closes, before privacy mode is turned off.
-/// With "lock after session end", waits until the lock screen is up, so that switching the
-/// monitors back on never shows the unlocked desktop. If the injected lock shortcut did not
-/// work, asks the screen locker directly once more.
+/// Like the console of a Windows machine after an RDP session, the console comes back locked,
+/// whatever the client's "lock after session end" option says: the lock screen is brought up
+/// before the monitors are switched back on, so the unlocked desktop never shows.
 ///
-/// If the screen still does not lock, privacy mode is turned off anyway: keeping the console
-/// black with nobody connected would leave the person at it no way back but a reboot.
-pub async fn before_turn_off_on_close(conn_id: i32, lock_requested: bool) {
-    if !lock_requested
-        || is_taken_over(conn_id)
-        || !super::is_current_privacy_mode_impl(PRIVACY_MODE_IMPL)
-    {
+/// If the screen does not lock, privacy mode is turned off anyway: keeping the console black
+/// with nobody connected would leave the person at it no way back but a reboot.
+pub async fn before_turn_off_on_close(conn_id: i32) {
+    if is_taken_over(conn_id) || !super::is_current_privacy_mode_impl(PRIVACY_MODE_IMPL) {
         return;
     }
-    let locked = tokio::task::spawn_blocking(|| {
-        let timeout = Duration::from_secs(5);
-        x11_privacy::wait_for_screen_locked(timeout)
-            || (x11_privacy::lock_screen() && x11_privacy::wait_for_screen_locked(timeout))
-    })
-    .await;
-    match locked {
+    match tokio::task::spawn_blocking(lock_and_wait).await {
         Ok(true) => {}
         Ok(false) => log::error!("The screen did not lock before leaving privacy mode"),
         Err(e) => log::error!("Failed to wait for the screen to lock: {}", e),
@@ -102,6 +100,13 @@ impl PrivacyModeImpl {
         }
     }
 
+    /// Used when privacy mode ends without its connection asking for it (server shutdown).
+    fn lock_if_active(&self) {
+        if self.guard.is_some() && !is_taken_over(self.conn_id) && !lock_and_wait() {
+            log::error!("The screen did not lock before leaving privacy mode");
+        }
+    }
+
     fn release(&mut self) -> ResultType<()> {
         let res = match self.guard.take() {
             Some(guard) => guard.turn_off().map_err(|e| anyhow!(e.to_string())),
@@ -123,6 +128,7 @@ impl PrivacyMode for PrivacyModeImpl {
     }
 
     fn clear(&mut self) {
+        self.lock_if_active();
         if let Err(e) = self.release() {
             log::error!("Failed to turn off x11 privacy mode: {}", e);
         }
@@ -150,6 +156,11 @@ impl PrivacyMode for PrivacyModeImpl {
         _state: Option<PrivacyModeState>,
     ) -> ResultType<()> {
         self.check_off_conn_id(conn_id)?;
+        // The owner turning it off from its toolbar passes its own id; the server shutting down
+        // passes none, and nobody is connected then to see the desktop.
+        if conn_id == INVALID_PRIVACY_MODE_CONN_ID {
+            self.lock_if_active();
+        }
         self.release()
     }
 
